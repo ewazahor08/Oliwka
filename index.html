@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dojazd do ALK</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1c2230; --muted:#667085; --accent:#1a73e8; --line:#e3e6eb; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#12151c; --card:#1b2029; --text:#e8ecf3; --muted:#9aa4b5; --accent:#6aa8ff; --line:#2a3140; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.45 system-ui,sans-serif; background:var(--bg); color:var(--text); }
+  .wrap { display:grid; grid-template-columns: 380px 1fr; height:100vh; }
+  aside { padding:16px; overflow:auto; background:var(--card); border-right:1px solid var(--line); }
+  h1 { font-size:1.25rem; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 14px; font-size:.9rem; }
+  .summary { display:flex; gap:12px; margin-bottom:14px; }
+  .summary div { flex:1; background:var(--bg); border-radius:10px; padding:10px; text-align:center; }
+  .summary b { display:block; font-size:1.2rem; }
+  .summary span { color:var(--muted); font-size:.8rem; }
+  ol { list-style:none; margin:0; padding:0; }
+  li.stop { display:flex; gap:12px; padding:10px; border-radius:10px; cursor:pointer; border:1px solid transparent; }
+  li.stop:hover, li.stop.active { background:var(--bg); border-color:var(--line); }
+  .badge { flex:none; width:28px; height:28px; border-radius:50%; background:var(--accent); color:#fff; display:grid; place-items:center; font-weight:700; font-size:.85rem; }
+  .badge.end { background:#d93025; }
+  .name { font-weight:600; }
+  .addr { color:var(--muted); font-size:.85rem; }
+  .leg { margin:0 0 0 14px; padding:2px 0 2px 22px; border-left:2px dashed var(--line); color:var(--muted); font-size:.85rem; }
+  .btns { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+  button, a.btn { font:inherit; padding:9px 14px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--text); cursor:pointer; text-decoration:none; }
+  button.primary, a.btn.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  #status { margin-top:10px; font-size:.8rem; color:var(--muted); }
+  #map { height:100%; }
+  @media (max-width:760px) {
+    .wrap { grid-template-columns:1fr; grid-template-rows: 55vh auto; height:auto; }
+    #map { order:-1; height:55vh; }
+    aside { border-right:0; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <aside>
+    <h1>Dojazd do ALK 🚗</h1>
+    <p class="sub">Trasa samochodem · 4 punkty · Warszawa</p>
+    <div class="summary">
+      <div><b id="dist">—</b><span>dystans</span></div>
+      <div><b id="time">—</b><span>czas jazdy</span></div>
+    </div>
+    <ol id="stops"></ol>
+    <div class="btns">
+      <a class="btn primary" id="gmaps" target="_blank" rel="noopener">Otwórz w Google Maps</a>
+      <button id="fit">Pokaż całą trasę</button>
+    </div>
+    <div id="status"></div>
+  </aside>
+  <div id="map"></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+// Punkty trasy w kolejności. "approx" = współrzędne zapasowe, używane gdy geokodowanie nie zadziała.
+const STOPS = [
+  { name: "Start",              addr: "Aleja Krakowska 279, 02-133 Warszawa",            approx: [52.1585, 20.9590] },
+  { name: "Przystanek 1",       addr: "Stefana Starzyńskiego 3, 03-461 Warszawa",        approx: [52.2530, 21.0385] },
+  { name: "Przystanek 2 (Sante)", addr: "Sante, Jagiellońska 55A, 03-301 Warszawa",      approx: [52.2905, 21.0405] },
+  { name: "Cel: ALK",           addr: "Paczkomat InPost, Jagiellońska 57/59, 03-301 Warszawa", approx: [52.2910, 21.0400] },
+];
+
+const map = L.map('map').setView([52.22, 21.0], 11);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19, attribution: '© OpenStreetMap'
+}).addTo(map);
+
+const statusEl = document.getElementById('status');
+const fmtKm = m => (m/1000).toFixed(1).replace('.', ',') + ' km';
+const fmtMin = s => { const m = Math.round(s/60); return m >= 60 ? Math.floor(m/60)+' h '+(m%60)+' min' : m+' min'; };
+
+async function geocode(s) {
+  try {
+    const url = 'https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=pl&q=' + encodeURIComponent(s.addr.replace(/^Sante, |^Paczkomat InPost, /, ''));
+    const r = await fetch(url, { headers: { 'Accept-Language': 'pl' } });
+    const j = await r.json();
+    if (j[0]) { s.ll = [parseFloat(j[0].lat), parseFloat(j[0].lon)]; s.geocoded = true; return; }
+  } catch (e) {}
+  s.ll = s.approx; s.geocoded = false;
+}
+
+const markers = [];
+function renderList(legs) {
+  const ol = document.getElementById('stops');
+  ol.innerHTML = '';
+  STOPS.forEach((s, i) => {
+    const li = document.createElement('li');
+    li.className = 'stop';
+    li.innerHTML = `<div class="badge ${i === STOPS.length-1 ? 'end' : ''}">${i === STOPS.length-1 ? '⚑' : i+1}</div>
+      <div><div class="name">${s.name}</div><div class="addr">${s.addr}</div></div>`;
+    li.onclick = () => { map.setView(s.ll, 16); markers[i].openPopup();
+      document.querySelectorAll('li.stop').forEach(e => e.classList.remove('active')); li.classList.add('active'); };
+    ol.appendChild(li);
+    if (legs && legs[i]) {
+      const d = document.createElement('div');
+      d.className = 'leg';
+      d.textContent = '↓ ' + fmtKm(legs[i].distance) + ' · ' + fmtMin(legs[i].duration);
+      ol.appendChild(d);
+    }
+  });
+}
+
+async function init() {
+  statusEl.textContent = 'Wyznaczanie trasy…';
+  await Promise.all(STOPS.map(geocode));
+
+  STOPS.forEach((s, i) => {
+    const m = L.marker(s.ll).addTo(map).bindPopup(`<b>${s.name}</b><br>${s.addr}`);
+    markers.push(m);
+  });
+
+  const coords = STOPS.map(s => s.ll[1] + ',' + s.ll[0]).join(';');
+  let bounds;
+  try {
+    const r = await fetch('https://router.project-osrm.org/route/v1/driving/' + coords + '?overview=full&geometries=geojson');
+    const j = await r.json();
+    const route = j.routes[0];
+    const line = L.geoJSON(route.geometry, { style: { color: '#1a73e8', weight: 6, opacity: .85 } }).addTo(map);
+    bounds = line.getBounds();
+    document.getElementById('dist').textContent = fmtKm(route.distance);
+    document.getElementById('time').textContent = fmtMin(route.duration);
+    renderList(route.legs);
+    statusEl.textContent = STOPS.every(s => s.geocoded) ? '' : 'Część adresów pokazana orientacyjnie — sprawdź w Google Maps.';
+  } catch (e) {
+    const line = L.polyline(STOPS.map(s => s.ll), { color: '#1a73e8', weight: 4, dashArray: '8 8' }).addTo(map);
+    bounds = line.getBounds();
+    renderList(null);
+    statusEl.textContent = 'Nie udało się pobrać trasy drogowej — pokazano linię prostą. Użyj przycisku Google Maps.';
+  }
+  map.fitBounds(bounds, { padding: [30, 30] });
+  document.getElementById('fit').onclick = () => map.fitBounds(bounds, { padding: [30, 30] });
+}
+
+document.getElementById('gmaps').href = 'https://www.google.com/maps/dir/' +
+  STOPS.map(s => encodeURIComponent(s.addr)).join('/') + '/data=!4m2!4m1!3e0';
+
+init();
+</script>
+</body>
+</html>
